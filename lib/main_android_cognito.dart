@@ -1,15 +1,12 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:typed_data/typed_buffers.dart';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:amazon_cognito_identity_dart_2/cognito.dart';
 import 'package:aws_common/aws_common.dart';
 import 'package:aws_signature_v4/aws_signature_v4.dart';
 import 'package:mqtt5_client/mqtt5_client.dart';
 import 'package:mqtt5_client/mqtt5_server_client.dart';
-import 'package:mqtt5_client/mqtt5_browser_client.dart';
 
 import 'secrets.dart';
 
@@ -36,6 +33,7 @@ class _MyAppState extends State<MyApp> {
   late String _awsSecretKey;
   late String _awsSessionToken;
   late MqttClient? _mqtt;
+  final TextEditingController _messageController = TextEditingController();
 
   Future<bool> _getAwsCredentialsFromCognito() async {
     _cognitoUserPool =
@@ -82,9 +80,35 @@ class _MyAppState extends State<MyApp> {
   Future<MqttClient?> _connectToMqtt(String signedUrl) async {
     final clientId = 'basicPubSub'; // from Python/JS examples
     final mqtt = MqttServerClient(signedUrl, clientId);
-    mqtt.port = 8883;
-    // TODO: further initialization
-    return null;
+    mqtt.port = 443;
+    mqtt.useWebSocket = true;
+
+    mqtt.onDisconnected = () {
+      print('MQTT Disconnected');
+    };
+    mqtt.onConnected = () {
+      print('MQTT Connected');
+    };
+    mqtt.connectionMessage = MqttConnectMessage()
+        .withClientIdentifier(clientId)
+        .startClean()
+        .withWillQos(MqttQos.atLeastOnce);
+    try {
+      await mqtt.connect();
+      setState(() {
+        _state = _State.connected;
+      });
+      return mqtt;
+    } catch (e) {
+      print('MQTT Connection error: $e');
+      setState(() {
+        _state = _State.error;
+        _errorMessage = 'Cannot connect to MQTT: $e';
+      });
+      return null;
+    }
+
+    return mqtt;
   }
 
   @override
@@ -102,17 +126,27 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _publishSpamMessage() {
-    final topic = 'testTopic';
+    final topic = 'android/test';
+    final message = _messageController.text.isNotEmpty 
+        ? _messageController.text 
+        : 'Hello, IoT';
     final buffer = Uint8Buffer();
-    buffer.addAll(utf8.encode('Hello, IoT!'));
+    buffer.addAll(utf8.encode(json.encode({"message": message})));
     try {
       _mqtt!.publishMessage(topic, MqttQos.atLeastOnce, buffer);
+      _messageController.clear(); // Clear the input field after successful publish
     } catch (error) {
       setState(() {
         _state = _State.error;
         _errorMessage = 'Cannot publish message: $error';
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
   }
 
   Widget _buildHomePage() {
@@ -122,12 +156,24 @@ class _MyAppState extends State<MyApp> {
       case _State.connected:
         return Center(
           child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text('Connected'),
-              SizedBox(height: 40),
+              SizedBox(height: 20),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 40),
+                child: TextField(
+                  controller: _messageController,
+                  decoration: InputDecoration(
+                    hintText: 'Enter message to send',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              SizedBox(height: 20),
               ElevatedButton(
                   onPressed: _publishSpamMessage,
-                  child: const Text('Spam IoT')),
+                  child: const Text('Send IoT Message')),
             ],
           ),
         );
@@ -152,4 +198,9 @@ class _MyAppState extends State<MyApp> {
       ),
     );
   }
+}
+
+void main() {
+  print('STARTING APP (print)');
+  runApp(const MyApp());
 }
