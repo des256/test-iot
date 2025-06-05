@@ -195,3 +195,8 @@ class _MyAppState extends State<MyApp> {
     );
   }
 }
+
+void main() {
+  print('STARTING APP (print)');
+  runApp(const MyApp());
+}
