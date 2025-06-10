@@ -7,6 +7,7 @@ import 'package:aws_common/aws_common.dart';
 import 'package:aws_signature_v4/aws_signature_v4.dart';
 import 'package:mqtt5_client/mqtt5_client.dart';
 import 'package:mqtt5_client/mqtt5_server_client.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
 import 'secrets.dart';
 
@@ -14,21 +15,22 @@ enum _State {
   initializing,
   connected,
   error,
+  noInternet,
 }
 
 class MyApp extends StatefulWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
   _State _state = _State.initializing;
+  _State? _previousState;
   String? _errorMessage;
   late CognitoUserPool _cognitoUserPool;
-  late CognitoUserSession _cognitoSession;
+  late CognitoUserSession? _cognitoSession;
   late String _awsAccessKeyId;
   late String _awsSecretKey;
   late String _awsSessionToken;
@@ -40,14 +42,10 @@ class _MyAppState extends State<MyApp> {
         CognitoUserPool(secretCognitoPoolId, secretCognitoAppClientId);
     CognitoCredentials cognitoCredentials =
         CognitoCredentials(secretCognitoIdentityPoolId, _cognitoUserPool);
-    final user = CognitoUser(secretCognitoUserName, _cognitoUserPool);
-    final authDetails = AuthenticationDetails(
-        username: secretCognitoUserName, password: secretCognitoPassword);
-    user.setAuthenticationFlowType("USER_PASSWORD_AUTH");
+
     try {
-      _cognitoSession = (await user.authenticateUser(authDetails))!;
       await cognitoCredentials
-          .getAwsCredentials(_cognitoSession.getIdToken().getJwtToken());
+          .getGuestAwsCredentialsId();
       _awsAccessKeyId = cognitoCredentials.accessKeyId!;
       _awsSecretKey = cognitoCredentials.secretAccessKey!;
       _awsSessionToken = cognitoCredentials.sessionToken!;
@@ -114,15 +112,48 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
-    () async {
-      if (!await _getAwsCredentialsFromCognito()) {
-        return;
+    _initConnectivity();
+    _initializeApp();
+  }
+
+  Future<void> _initConnectivity() async {
+    final connectivity = Connectivity();
+    connectivity.onConnectivityChanged.listen((ConnectivityResult result) {
+      if (result == ConnectivityResult.none) {
+        if (_state != _State.noInternet) {
+          _previousState = _state;
+          setState(() {
+            _state = _State.noInternet;
+          });
+        }
+      } else {
+        if (_state == _State.noInternet && _previousState != null) {
+          setState(() {
+            _state = _previousState!;
+          });
+          if (_previousState == _State.connected && _mqtt == null) {
+            _initializeApp();
+          }
+        }
       }
+    });
 
-      final signedUrl = await _buildAwsRequestUrlFromAwsCredentials();
+    final result = await connectivity.checkConnectivity();
+    if (result == ConnectivityResult.none) {
+      setState(() {
+        _previousState = _state;
+        _state = _State.noInternet;
+      });
+    }
+  }
 
-      _mqtt = await _connectToMqtt(signedUrl);
-    }();
+  Future<void> _initializeApp() async {
+    if (!await _getAwsCredentialsFromCognito()) {
+      return;
+    }
+
+    final signedUrl = await _buildAwsRequestUrlFromAwsCredentials();
+    _mqtt = await _connectToMqtt(signedUrl);
   }
 
   void _publishSpamMessage() {
@@ -179,6 +210,20 @@ class _MyAppState extends State<MyApp> {
         );
       case _State.error:
         return Center(child: Text(_errorMessage!));
+      case _State.noInternet:
+        return const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.signal_wifi_off, size: 64, color: Colors.grey),
+              SizedBox(height: 16),
+              Text('No Internet Connection',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              SizedBox(height: 8),
+              Text('Please check your connection and try again'),
+            ],
+          ),
+        );
     }
   }
 
