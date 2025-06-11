@@ -1,58 +1,73 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:typed_data/typed_buffers.dart';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:amazon_cognito_identity_dart_2/cognito.dart';
-import 'package:aws_common/aws_common.dart';
-import 'package:aws_signature_v4/aws_signature_v4.dart';
 import 'package:mqtt5_client/mqtt5_client.dart';
-import 'package:mqtt5_client/mqtt5_server_client.dart';
-import 'package:mqtt5_client/mqtt5_browser_client.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
 import 'secrets.dart';
+import 'iot_service.dart';
 
 enum _State {
   initializing,
   connected,
   error,
+  noInternet,
 }
 
 class MyApp extends StatefulWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
   _State _state = _State.initializing;
+  _State? _previousState;
   String? _errorMessage;
   late CognitoUserPool _cognitoUserPool;
-  late CognitoUserSession _cognitoSession;
+  late CognitoUserSession? _cognitoSession;
   late String _awsAccessKeyId;
   late String _awsSecretKey;
   late String _awsSessionToken;
+  late IotService _iotService;
   late MqttClient? _mqtt;
+  final TextEditingController _messageController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _iotService = IotService(
+      region: secretAwsRegion,
+      mqttEndpoint: secretIotCoreMqttEndpoint,
+      httpEndpoint: secretIotCoreHttpEndpoint,
+      stationCode: secretStationCode,
+    );
+    _initConnectivity();
+    _initializeApp();
+  }
 
   Future<bool> _getAwsCredentialsFromCognito() async {
     _cognitoUserPool =
         CognitoUserPool(secretCognitoPoolId, secretCognitoAppClientId);
     CognitoCredentials cognitoCredentials =
         CognitoCredentials(secretCognitoIdentityPoolId, _cognitoUserPool);
-    final user = CognitoUser(secretCognitoUserName, _cognitoUserPool);
-    final authDetails = AuthenticationDetails(
-        username: secretCognitoUserName, password: secretCognitoPassword);
-    user.setAuthenticationFlowType("USER_PASSWORD_AUTH");
+
     try {
-      _cognitoSession = (await user.authenticateUser(authDetails))!;
-      await cognitoCredentials
-          .getAwsCredentials(_cognitoSession.getIdToken().getJwtToken());
+      await cognitoCredentials.getGuestAwsCredentialsId();
       _awsAccessKeyId = cognitoCredentials.accessKeyId!;
       _awsSecretKey = cognitoCredentials.secretAccessKey!;
       _awsSessionToken = cognitoCredentials.sessionToken!;
+
+      _iotService.setCredentials(AwsCredentials(
+        accessKeyId: _awsAccessKeyId,
+        secretKey: _awsSecretKey,
+        sessionToken: _awsSessionToken,
+      ));
+
       return true;
     } catch (error) {
       setState(() {
@@ -63,56 +78,95 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  Future<String> _buildAwsRequestUrlFromAwsCredentials() async {
-    final awsCredentials = AWSCredentials(_awsAccessKeyId, _awsSecretKey);
-    final signer = AWSSigV4Signer(
-        credentialsProvider: AWSCredentialsProvider(awsCredentials));
-    final credentialScope = AWSCredentialScope.raw(
-        region: secretAwsRegion, service: 'iotdevicegateway');
-    final baseUrl = 'wss://$secretIotCoreEndpoint/mqtt';
-    final request = AWSHttpRequest.get(Uri.parse(baseUrl));
-    final signedUrl = await signer.presign(request,
-        credentialScope: credentialScope, expiresIn: Duration(seconds: 300));
-    final encodedSessionToken = Uri.encodeComponent(_awsSessionToken);
-    final signedUrlWithSessionToken =
-        '${signedUrl.toString()}&X-Amz-Security-Token=$encodedSessionToken';
-    return signedUrlWithSessionToken;
+  Future<void> _initializeApp() async {
+    if (!await _getAwsCredentialsFromCognito()) {
+      return;
+    }
+
+    try {
+      await _iotService.createOrGetThing();
+      _mqtt = await _iotService.connectMqtt();
+      await _iotService.getInitialState();
+
+      _mqtt!.updates.listen((List<MqttReceivedMessage<MqttMessage>> c) {
+        for (final MqttReceivedMessage<MqttMessage> message in c) {
+          final payload = message.payload as MqttPublishMessage;
+          final String? topic = message.topic;
+          final payloadBytes = payload.payload.message;
+          final body = utf8.decode(payloadBytes!.toList());
+          final jsonBody = jsonDecode(body);
+          print('Message received ($topic): $body');
+          if ('${_iotService.prefix}/update/delta' == topic) {
+            _iotService.updateStateFromDelta(jsonBody);
+            setState(() {});
+          }
+        }
+      });
+
+      setState(() {
+        _state = _State.connected;
+      });
+    } catch (error) {
+      setState(() {
+        _errorMessage = error.toString();
+        _state = _State.error;
+      });
+    }
   }
 
-  Future<MqttClient?> _connectToMqtt(String signedUrl) async {
-    final clientId = 'basicPubSub'; // from Python/JS examples
-    final mqtt = MqttServerClient(signedUrl, clientId);
-    mqtt.port = 8883;
-    // TODO: further initialization
-    return null;
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    () async {
-      if (!await _getAwsCredentialsFromCognito()) {
-        return;
+  Future<void> _initConnectivity() async {
+    final connectivity = Connectivity();
+    connectivity.onConnectivityChanged.listen((ConnectivityResult result) {
+      if (result == ConnectivityResult.none) {
+        if (_state != _State.noInternet) {
+          _previousState = _state;
+          setState(() {
+            _state = _State.noInternet;
+            _mqtt?.disconnect();
+            _mqtt = null;
+          });
+        }
+      } else {
+        if (_state == _State.noInternet && _previousState != null) {
+          setState(() {
+            _state = _previousState!;
+          });
+          if (_previousState == _State.connected && _mqtt == null) {
+            _initializeApp();
+          }
+        }
       }
+    });
 
-      final signedUrl = await _buildAwsRequestUrlFromAwsCredentials();
-
-      _mqtt = await _connectToMqtt(signedUrl);
-    }();
+    final result = await connectivity.checkConnectivity();
+    if (result == ConnectivityResult.none) {
+      setState(() {
+        _previousState = _state;
+        _state = _State.noInternet;
+      });
+    }
   }
 
   void _publishSpamMessage() {
-    final topic = 'testTopic';
-    final buffer = Uint8Buffer();
-    buffer.addAll(utf8.encode('Hello, IoT!'));
+    final message = _messageController.text.isNotEmpty 
+        ? int.parse(_messageController.text)
+        : 0;
     try {
-      _mqtt!.publishMessage(topic, MqttQos.atLeastOnce, buffer);
+      _iotService.updateStateInternal({'layer': message});
+      _messageController.clear();
     } catch (error) {
       setState(() {
+        _errorMessage = error.toString();
         _state = _State.error;
-        _errorMessage = 'Cannot publish message: $error';
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    _iotService.disconnect();
+    super.dispose();
   }
 
   Widget _buildHomePage() {
@@ -122,17 +176,58 @@ class _MyAppState extends State<MyApp> {
       case _State.connected:
         return Center(
           child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text('Connected'),
-              SizedBox(height: 40),
+              SizedBox(height: 20),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text('Current layer: '),
+                  Text(
+                    _iotService?.state['layer']?.toString() ?? '-',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              SizedBox(height: 20),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 40),
+                child: TextField(
+                  controller: _messageController,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.digitsOnly,
+                  ],
+                  decoration: InputDecoration(
+                    hintText: 'Enter layer number',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              SizedBox(height: 20),
               ElevatedButton(
                   onPressed: _publishSpamMessage,
-                  child: const Text('Spam IoT')),
+                  child: const Text('Send IoT Message')),
             ],
           ),
         );
       case _State.error:
         return Center(child: Text(_errorMessage!));
+      case _State.noInternet:
+        return const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.signal_wifi_off, size: 64, color: Colors.grey),
+              SizedBox(height: 16),
+              Text('No Internet Connection',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              SizedBox(height: 8),
+              Text('Please check your connection and try again'),
+            ],
+          ),
+        );
     }
   }
 
@@ -152,4 +247,9 @@ class _MyAppState extends State<MyApp> {
       ),
     );
   }
+}
+
+void main() {
+  print('STARTING APP (print)');
+  runApp(const MyApp());
 }
