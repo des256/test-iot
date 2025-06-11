@@ -79,7 +79,7 @@ class _MyAppState extends State<MyApp> {
   void initState() {
     super.initState();
     () async {
-      _mqtt = await _connectToMqtt('wss://$secretIotCoreEndpoint/mqtt');
+      _mqtt = await _connectToMqtt('wss://$secretIotCoreMqttEndpoint/mqtt');
     }();
   }
 
