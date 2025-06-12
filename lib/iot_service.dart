@@ -167,6 +167,7 @@ class IotService {
       final mqtt = MqttServerClient(signedUrl, clientId);
       mqtt.port = 443;
       mqtt.useWebSocket = true;
+      mqtt.autoReconnect = true;
 
       mqtt.onDisconnected = () {
         print('MQTT Disconnected');
