@@ -69,7 +69,7 @@ class _MyAppState extends State<MyApp> {
         credentialsProvider: AWSCredentialsProvider(awsCredentials));
     final credentialScope = AWSCredentialScope.raw(
         region: secretAwsRegion, service: 'iotdevicegateway');
-    final baseUrl = 'wss://$secretIotCoreEndpoint/mqtt';
+    final baseUrl = 'wss://$secretIotCoreMqttEndpoint/mqtt';
     final request = AWSHttpRequest.get(Uri.parse(baseUrl));
     final signedUrl = await signer.presign(request,
         credentialScope: credentialScope, expiresIn: Duration(seconds: 300));
@@ -194,4 +194,9 @@ class _MyAppState extends State<MyApp> {
       ),
     );
   }
+}
+
+void main() {
+  print('STARTING APP (print)');
+  runApp(const MyApp());
 }
