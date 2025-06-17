@@ -64,7 +64,9 @@ class IotService {
         throw Exception('Failed to create thing shadow: $errorBody');
       } else if (response.statusCode == 404) {
         final initialState = {
-          "layer": 1
+          "contentId": "9de22fc4-c87b-4809-bdb0-dee4be237745",
+          "layer": 1,
+          "visible": true,
         };
         publishMessage('\$aws/things/$thingId/shadow/update', {
           "state": {
@@ -243,11 +245,11 @@ class IotService {
 
     void updateStateFromDelta(stateDelta) {
       this.state = {...this.state, ...stateDelta['state']};
-      publishMessage('$prefix/update', {
-        "state": {
-          "desired": this.state,
-          "reported": this.state,
-        }
-      });
+      // publishMessage('$prefix/update', {
+      //   "state": {
+      //     "desired": this.state,
+      //     "reported": this.state,
+      //   }
+      // });
     }
   }
